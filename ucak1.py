@@ -11,13 +11,7 @@ import os
 import subprocess
 import math
 
-# Renk Kodları
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
-BLUE = "\033[94m"
-CYAN = "\033[96m"
-ENDC = "\033[0m"
+GREEN, YELLOW, RED, BLUE, CYAN, ENDC = "\033[92m", "\033[93m", "\033[91m", "\033[94m", "\033[96m", "\033[0m"
 
 SHM_NAME = "telemetry_shared"
 SHM_SIZE = 4096
@@ -49,25 +43,7 @@ async def run():
     await drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
     await drone.offboard.start()
 
-    position = await drone.telemetry.position().__anext__()
-    asyncio.create_task(test_maneuver(drone, position))
     await send_telemetry_forever(drone, drone_id, telemetry_shm)
-
-async def test_maneuver(drone, current_position):
-    await asyncio.sleep(30)
-    print(f"{YELLOW}[TEST] 30sn sonra GOTO testi başlatılıyor...{ENDC}")
-    angle_rad = math.radians(45)
-    d = 20 / 6371000
-
-    lat, lon = current_position.latitude_deg, current_position.longitude_deg
-    target_lat = math.degrees(math.radians(lat) + d * math.cos(angle_rad))
-    target_lon = math.degrees(math.radians(lon) + d * math.sin(angle_rad) / math.cos(math.radians(lat)))
-
-    try:
-        await drone.action.goto_location(target_lat, target_lon, current_position.absolute_altitude_m, 45.0)
-        print(f"{CYAN}[TEST] GOTO gönderildi: {target_lat:.6f}, {target_lon:.6f}{ENDC}")
-    except Exception as e:
-        print(f"{RED}[TEST HATA] {e}{ENDC}")
 
 async def send_telemetry_forever(drone, drone_id, telemetry_shm):
     start_time = datetime.now()
@@ -83,14 +59,11 @@ async def send_telemetry_forever(drone, drone_id, telemetry_shm):
 
             data = {
                 "latitude": pos.latitude_deg, "longitude": pos.longitude_deg,
-                "absolute_altitude": pos.absolute_altitude_m, "relative_altitude": pos.relative_altitude_m,
+                "absolute_altitude": pos.absolute_altitude_m,
                 "speed": math.hypot(vel.velocity.north_m_s, vel.velocity.east_m_s),
                 "roll": att.roll_deg, "pitch": att.pitch_deg, "yaw": att.yaw_deg,
                 "flight_mode": str(fm), "battery_percent": bat.remaining_percent * 100,
-                "battery_voltage": bat.voltage_v,
-                "satellites_visible": getattr(gps, "satellites_visible", "N/A"),
-                "fix_type": getattr(gps, "fix_type", "N/A"),
-                "uptime": f"{(datetime.now()-start_time).seconds//60:02}:{(datetime.now()-start_time).seconds%60:02}"
+                "satellites_visible": getattr(gps, "satellites_visible", "N/A")
             }
 
             try:
@@ -111,10 +84,10 @@ async def send_telemetry_forever(drone, drone_id, telemetry_shm):
                 print(f"{CYAN}[Drone{drone_id}] Telemetri paylaşıldı.{ENDC}")
 
             await apply_flocking_and_avoidance(drone_id, data, current, drone)
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.02)
         except Exception as e:
             print(f"{RED}Hata: {e}{ENDC}")
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.02)
 
 def calculate_distance(lat1, lon1, lat2, lon2):
     R = 6371000
@@ -125,29 +98,43 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 async def apply_flocking_and_avoidance(drone_id, my, all_data, drone):
-    for other_id, other in all_data.items():
-        if other_id == drone_id:
-            continue
+    my_lat, my_lon, my_yaw = my["latitude"], my["longitude"], my["yaw"]
 
-        dist = calculate_distance(my["latitude"], my["longitude"], other["latitude"], other["longitude"])
-        bearing = math.atan2(other["longitude"] - my["longitude"], other["latitude"] - my["latitude"])
+    others = [d for oid, d in all_data.items() if oid != drone_id]
+    if not others:
+        await drone.offboard.set_velocity_ned(VelocityNedYaw(1.0, 0.0, 0.0, my_yaw))
+        return
 
-        if dist < 10:
-            print(f"{RED}🚨 Yakın! Drone{other_id} ({dist:.1f}m) → Kaçınılıyor...{ENDC}")
-            angle = (bearing + math.pi) % (2 * math.pi)
-            d = 10 / 6371000
-            lat = math.degrees(math.radians(my["latitude"]) + d * math.cos(angle))
-            lon = math.degrees(math.radians(my["longitude"]) + d * math.sin(angle) / math.cos(math.radians(my["latitude"])))
+    nearest = min(others, key=lambda o: calculate_distance(my_lat, my_lon, o["latitude"], o["longitude"]))
+    dist = calculate_distance(my_lat, my_lon, nearest["latitude"], nearest["longitude"])
 
-            try:
-                await drone.action.goto_location(lat, lon, 10.0, math.degrees(angle))
-                await asyncio.sleep(5)
-            except:
-                await drone.offboard.set_velocity_ned(VelocityNedYaw(math.cos(angle), math.sin(angle), 0.0, math.degrees(angle)))
-        elif dist < 50:
-            await drone.offboard.set_velocity_ned(VelocityNedYaw(0.5, 0.0, 0.0, my["yaw"]))
-        else:
-            await drone.offboard.set_velocity_ned(VelocityNedYaw(1.0, 0.0, 0.0, my["yaw"]))
+    if dist < 7:
+        print(f"{RED}🚨 Kaçınma: {dist:.1f}m{ENDC}")
+        angle = math.atan2(my_lon - nearest["longitude"], my_lat - nearest["latitude"])
+        lat = math.degrees(math.radians(my_lat) + (5 / 6371000) * math.cos(angle))
+        lon = math.degrees(math.radians(my_lon) + (5 / 6371000) * math.sin(angle) / math.cos(math.radians(my_lat)))
+        try:
+            await drone.action.goto_location(lat, lon, my["absolute_altitude"], math.degrees(angle))
+            await asyncio.sleep(3)
+        except Exception as e:
+            print(f"{RED}[Kaçınma GOTO Hatası] {e}{ENDC}")
+
+    elif 7 <= dist <= 30:
+        print(f"{CYAN}🔄 Flocking Aktif: {dist:.1f}m{ENDC}")
+        sep_angle = math.atan2(my_lon - nearest["longitude"], my_lat - nearest["latitude"])
+        ali_angle = math.radians(nearest["yaw"])
+        coh_angle = math.atan2(nearest["longitude"] - my_lon, nearest["latitude"] - my_lat)
+
+        vx = 2 * math.cos(sep_angle) + 1 * math.cos(ali_angle) + 1 * math.cos(coh_angle)
+        vy = 2 * math.sin(sep_angle) + 1 * math.sin(ali_angle) + 1 * math.sin(coh_angle)
+        final_yaw = math.degrees(math.atan2(vy, vx))
+
+        await drone.offboard.set_velocity_ned(VelocityNedYaw(1.0, 0.0, 0.0, final_yaw))
+
+    else:
+        print(f"{YELLOW}🟢 Serbest uçuş: {dist:.1f}m{ENDC}")
+        await drone.offboard.set_velocity_ned(VelocityNedYaw(1.0, 0.0, 0.0, my_yaw))
 
 if __name__ == "__main__":
     asyncio.run(run())
+

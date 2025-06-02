@@ -1,256 +1,202 @@
+#!/usr/bin/env python3
+
 import customtkinter as ctk
 import subprocess
 import time
 import multiprocessing.shared_memory as shm
 import json
-from PIL import Image, ImageDraw, ImageTk # ImageTk eklendi
-
-# ========== YAPILANDIRMA ==========
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
-
-# Sabitler
-SHM_NAME = "telemetry_shared"
-SHM_SIZE = 4096
-TIMEOUT_THRESHOLD = 3 # saniye
-
-# --- Resim Yolları ---
-# Statik yer tutucu resim (drone durduğunda veya GIF yüklenemediğinde)
-DRONE_IMAGE_PATH = "drone_feed_placeholder.png"
-# Drone uçuşu için animasyonlu GIF
-DRONE_GIF_PATH = "/home/arda/Masaüstü/Drone.gif" # Kullanıcının belirttiği yol
-
-# --- Kart ve Besleme Boyutları ---
-CARD_WIDTH_SMALL = 300 # Daha küçük kart genişliği
-CARD_HEIGHT_SMALL = 380 # Daha küçük kart yüksekliği (içeriğe göre ayarlandı)
-FEED_WIDTH_SMALL = CARD_WIDTH_SMALL - 40 # örn. 260
-FEED_HEIGHT_SMALL = 150 # Daha küçük besleme yüksekliği
-
-# Renk Teması
-COLORS = {
-    "primary": "#1E1E2E",       # Ana navigasyon kenar çubuğu
-    "secondary": "#2A2A3A",     # QGC paneli, nav butonları için hover
-    "tertiary": "#272A3A",      # QGC paneli için biraz farklı bir ton (gerekirse)
-    "accent": "#4E9FEC",
-    "success": "#2ECC71",
-    "success_hover": "#27AE60",
-    "danger": "#E74C3C",
-    "danger_hover": "#C0392B",
-    "warning": "#F39C12",
-    "dark": "#121212",          # Ana içerik alanı arka planı
-    "card_bg": "#2C3E50",
-    "text_primary": "#FFFFFF",
-    "text_secondary": "#B8B8B8",
-    "gray": "#7F8C8D",
-    "disconnected": "#5B5B5B" # Bağlantı kesildiğinde kullanılacak renk
-}
-
-# Test için, DRONE_IMAGE_PATH bulunamazsa sahte bir yer tutucu oluştur:
-try:
-    with Image.open(DRONE_IMAGE_PATH) as img:
-        img.load() # Dosyanın okunabilir olduğundan emin ol
-except FileNotFoundError:
-    print(f"BİLGİ: {DRONE_IMAGE_PATH} konumunda sahte yer tutucu resim oluşturuluyor")
-    try:
-        # COLORS["dark"] (#121212) ile eşleşmesi için (18, 18, 18)
-        img_pl = Image.new('RGB', (FEED_WIDTH_SMALL, FEED_HEIGHT_SMALL), color = (18, 18, 18))
-        draw = ImageDraw.Draw(img_pl)
-        text = "Görüntü Yok"
-        # Basit metin ortalama
-        bbox = draw.textbbox((0,0), text, font=ImageFont.truetype("arial.ttf", 20)) # Font ekledik
-        textwidth = bbox[2] - bbox[0]
-        textheight = bbox[3] - bbox[1]
-        x = (img_pl.width - textwidth) / 2
-        y = (img_pl.height - textheight) / 2
-        draw.text((x, y), text, fill=(248, 248, 242), font=ImageFont.truetype("arial.ttf", 20)) # Font ekledik
-        img_pl.save(DRONE_IMAGE_PATH)
-    except Exception as e:
-        print(f"HATA: Sahte yer tutucu resim oluşturulamadı: {e}")
-# ------------------------------------------------------------
-
-
-# Fontlar
-FONTS = {
-    "title": ("Roboto", 24, "bold"),
-    "subtitle": ("Roboto", 16, "bold"),
-    "body": ("Roboto", 14),
-    "small": ("Roboto", 12),
-    "button": ("Roboto", 14, "bold"),
-    "button_small": ("Roboto", 12, "bold") # Daha küçük kart butonları için
-}
+from PIL import Image, ImageTk # ImageTk is included
+from config import (
+    SHM_NAME, SHM_SIZE, TIMEOUT_THRESHOLD,
+    DRONE_IMAGE_PATH, DRONE_GIF_PATH,
+    CARD_WIDTH_SMALL, CARD_HEIGHT_SMALL, FEED_WIDTH_SMALL, FEED_HEIGHT_SMALL,
+    COLORS, COLORS_DARK, COLORS_LIGHT, FONTS, COMMANDS # COLORS_DARK ve COLORS_LIGHT eklendi
+)
 
 class DroneControlCenter:
     def __init__(self):
         self.app = ctk.CTk()
-        self.app.title("SwarMind PX4 Drone Kontrol Merkezi")
+        self.app.title("SwarMind PX4 Drone Control Center")
         self.app.geometry("1280x800")
         self.app.minsize(1024, 768)
 
-        # Durum değişkenleri
+        self.current_theme = "dark" # Başlangıç teması
+        self.colors = COLORS_DARK # Başlangıçta koyu tema renklerini kullan
+
+        # Configure grid weights for responsive layout
+        self.app.grid_columnconfigure(0, weight=0) # Nav sidebar fixed width
+        # self.app.grid_columnconfigure(1, weight=0) # QGC tools panel REMOVED
+        self.app.grid_columnconfigure(1, weight=1) # Main content area expands (was column 2)
+        self.app.grid_rowconfigure(0, weight=1) # Main row expands
+
+        # State variables
         self.last_telemetry_update_time = {1: 0.0, 2: 0.0}
         self.drone_process_commanded_active = {1: False, 2: False}
         self.is_drone_connected_via_telemetry = {1: False, 2: False}
 
-        # Dashboard drone kartları için UI eleman referansları
+        # UI element references for dashboard drone cards
         self.dash_drone1_card_ref = None
         self.dash_drone2_card_ref = None
         self.drone1_dashboard_status_light = None
         self.drone1_dashboard_status_label = None
         self.drone2_dashboard_status_light = None
         self.drone2_dashboard_status_label = None
-        self.drone_image_labels = {1: None, 2: None} # Resim/GIF gösterimi için
+        self.drone_image_labels = {1: None, 2: None} # For image/GIF display
 
-        # GIF Animasyon özellikleri
-        self.drone_gif_ctk_frames = {1: [], 2: []} # CTkImage nesnelerini sakla
+        # GIF Animation properties
+        self.drone_gif_ctk_frames = {1: [], 2: []} # Store CTkImage objects
         self.drone_gif_durations = {1: [], 2: []}
         self.drone_gif_current_frame_index = {1: 0, 2: 0}
         self.drone_gif_animation_job_id = {1: None, 2: None}
         self.gif_loaded_successfully = {1: False, 2: False}
 
-        # Telemetry görünümü için UI eleman referansları
+        # UI element references for telemetry view
         self.drone1_telemetry_connection_label = None
         self.drone2_telemetry_connection_label = None
         self.drone1_card_ref = None # Telemetry view card
         self.drone2_card_ref = None # Telemetry view card
-        self.drone1_data = {}
-        self.drone2_data = {}
+        self.drone1_data = {} # Labels for drone 1 telemetry values
+        self.drone2_data = {} # Labels for drone 2 telemetry values
 
-        self.commands = {
-            "qgc": """
-                gnome-terminal --title='QGroundControl' -- bash -c '
-                cd ~/PX4-Autopilot || exit 1;
-                ./QGroundControl.AppImage;
-                exec bash'
-            """,
-            "drone1": """
-                gnome-terminal --title='Drone1 & Aircraft1' -- bash -c '
-                cd ~/PX4-Autopilot || exit 1;
-                tmux kill-session -t drone1_session 2>/dev/null;
-                tmux new-session -d -s drone1_session "PX4_SYS_AUTOSTART=4002 PX4_SIM_MODEL=gz_x500 ./build/px4_sitl_default/bin/px4 -i 1";
-                tmux kill-session -t drone1_py 2>/dev/null;
-                tmux new-session -d -s drone1_py "python3 ~/Masaüstü/ucak1.py";
-                exec bash'
-            """,
-            "drone2": """
-                gnome-terminal --title='Drone2 & Aircraft2' -- bash -c '
-                cd ~/PX4-Autopilot || exit 1;
-                sleep 5;
-                tmux kill-session -t drone2_session 2>/dev/null;
-                tmux new-session -d -s drone2_session "PX4_SYS_AUTOSTART=4002 PX4_GZ_MODEL_POSE=\\"0,10,0,0,0,0\\" PX4_SIM_MODEL=gz_x500 ./build/px4_sitl_default/bin/px4 -i 2";
-                tmux kill-session -t drone2_py 2>/dev/null;
-                tmux new-session -d -s drone2_py "python3 ~/Masaüstü/ucak2.py";
-                exec bash'
-            """
-        }
-        self._load_static_placeholder_images()
+        self.static_placeholder_ctkimage = None # Initialize as None
+        
         self.setup_ui()
         self.update_telemetry()
 
-    def _load_static_placeholder_images(self):
-        """Statik yer tutucu CTkImage'ı önceden yükler."""
-        self.static_placeholder_ctkimage = None
+    def _load_static_placeholder_images(self, target_width, target_height):
+        """Pre-loads the static placeholder CTkImage with dynamic sizing."""
         try:
             pil_image = Image.open(DRONE_IMAGE_PATH)
-            pil_image_resized = pil_image.resize((FEED_WIDTH_SMALL, FEED_HEIGHT_SMALL), Image.Resampling.LANCZOS)
-            # CTkImage yerine ImageTk.PhotoImage kullanın, çünkü CTkImage animasyon etiketlerinde sorun yaratabilir
+            pil_image_resized = pil_image.resize((target_width, target_height), Image.Resampling.LANCZOS)
             self.static_placeholder_ctkimage = ImageTk.PhotoImage(pil_image_resized)
+            print(f"INFO: Static placeholder image loaded and resized to {target_width}x{target_height}.")
         except Exception as e:
-            print(f"HATA: Statik yer tutucu resim yüklenemedi '{DRONE_IMAGE_PATH}': {e}")
-
+            print(f"ERROR: Could not load static placeholder image '{DRONE_IMAGE_PATH}': {e}")
+            self.static_placeholder_ctkimage = None
 
     def setup_ui(self):
-        # ===== NAVİGASYON KENAR ÇUBUĞU (En Sol) =====
-        self.nav_sidebar = ctk.CTkFrame(self.app, width=220, corner_radius=0, fg_color=COLORS["primary"])
-        self.nav_sidebar.pack(side="left", fill="y")
+        # ===== NAVIGATION SIDEBAR (Far Left) =====
+        self.nav_sidebar = ctk.CTkFrame(self.app, width=220, corner_radius=0, fg_color=self.colors["primary"])
+        self.nav_sidebar.grid(row=0, column=0, sticky="nswe")
+        self.nav_sidebar.grid_propagate(False) # Prevent frame from shrinking to content
 
         self.logo_frame = ctk.CTkFrame(self.nav_sidebar, fg_color="transparent")
         self.logo_frame.pack(pady=(25, 25), padx=20, fill="x")
-        ctk.CTkLabel(self.logo_frame, text="SwarMind", font=FONTS["title"], text_color=COLORS["accent"]
+        ctk.CTkLabel(self.logo_frame, text="SwarMind", font=FONTS["title"], text_color=self.colors["accent"]
                      ).pack(side="left", padx=0)
-        ctk.CTkLabel(self.logo_frame, text="Kontrol", font=("Roboto", 24, "normal"), text_color=COLORS["text_primary"]
+        ctk.CTkLabel(self.logo_frame, text="Control", font=("Roboto", 24, "normal"), text_color=self.colors["text_primary"]
                      ).pack(side="left", padx=5)
 
         self.create_nav_buttons(self.nav_sidebar)
         self.create_system_controls(self.nav_sidebar)
 
-        # ===== QGC/ARAÇLAR YAN PANELİ (Orta Sol) =====
-        self.qgc_tools_panel = ctk.CTkFrame(self.app, width=180, corner_radius=0, fg_color=COLORS["secondary"])
-        self.qgc_tools_panel.pack(side="left", fill="y", padx=(1,0))
-        self._create_qgc_tools_panel_content(self.qgc_tools_panel)
+        # ===== QGC/TOOLS SIDE PANEL REMOVED =====
+        # self.qgc_tools_panel = ctk.CTkFrame(self.app, width=180, corner_radius=0, fg_color=self.colors["secondary"])
+        # self.qgc_tools_panel.grid(row=0, column=1, sticky="nswe", padx=(1,0))
+        # self.qgc_tools_panel.grid_propagate(False) 
+        # self._create_qgc_tools_panel_content(self.qgc_tools_panel) # Method will be removed
 
-
-        # ===== ANA İÇERİK ALANI (Sağ) =====
-        self.main_content_area = ctk.CTkFrame(self.app, corner_radius=0, fg_color=COLORS["dark"])
-        self.main_content_area.pack(side="left", fill="both", expand=True)
+        # ===== MAIN CONTENT AREA (Right) =====
+        self.main_content_area = ctk.CTkFrame(self.app, corner_radius=0, fg_color=self.colors["dark"])
+        self.main_content_area.grid(row=0, column=1, sticky="nswe") # Column changed from 2 to 1
+        self.main_content_area.grid_propagate(False)
 
         self.dashboard_frame = self.create_dashboard(self.main_content_area)
         self.telemetry_frame = self.create_telemetry_display(self.main_content_area)
 
         self.show_dashboard()
-
+        self._load_static_placeholder_images(FEED_WIDTH_SMALL, FEED_HEIGHT_SMALL)
 
     def create_nav_buttons(self, parent_sidebar):
         nav_buttons_frame = ctk.CTkFrame(parent_sidebar, fg_color="transparent")
         nav_buttons_frame.pack(fill="x", pady=(20,0))
         nav_buttons = [
             {"text": "Dashboard", "command": self.show_dashboard},
-            {"text": "Telemetri", "command": self.show_telemetry},
-            {"text": "Ayarlar", "command": lambda: print("Ayarlar tıklandı")}
+            {"text": "Telemetry", "command": self.show_telemetry},
+            {"text": "Settings", "command": lambda: print("Settings clicked")}
         ]
+        self.nav_button_refs = [] 
         for btn_info in nav_buttons:
-            ctk.CTkButton(
+            btn = ctk.CTkButton(
                 nav_buttons_frame,
                 text=btn_info['text'],
                 command=btn_info["command"],
                 height=40,
                 font=FONTS["button"],
                 fg_color="transparent",
-                hover_color=COLORS["secondary"],
-                text_color=COLORS["text_primary"],
+                hover_color=self.colors["secondary"],
+                text_color=self.colors["text_primary"],
                 corner_radius=8,
                 anchor="w"
-            ).pack(fill="x", padx=15, pady=6)
-
+            )
+            btn.pack(fill="x", padx=15, pady=6)
+            self.nav_button_refs.append(btn)
 
     def create_system_controls(self, parent_sidebar):
-        ctk.CTkFrame(parent_sidebar, height=1, fg_color=COLORS["secondary"]).pack(fill="x", padx=10, pady=(25,0))
-        ctk.CTkLabel(
-            parent_sidebar, text="Sistem Kontrolleri", font=FONTS["subtitle"], text_color=COLORS["text_secondary"]
-        ).pack(pady=(15, 10), padx=15, anchor="w")
+        ctk.CTkFrame(parent_sidebar, height=1, fg_color=self.colors["secondary"]).pack(fill="x", padx=10, pady=(25,0))
+        self.system_controls_title_label = ctk.CTkLabel( # Storing ref for color update
+            parent_sidebar, text="System Controls", font=FONTS["subtitle"], text_color=self.colors["text_secondary"]
+        )
+        self.system_controls_title_label.pack(pady=(15, 10), padx=15, anchor="w")
+        
         controls_frame = ctk.CTkFrame(parent_sidebar, fg_color="transparent")
         controls_frame.pack(fill="x", pady=(0,10))
-        controls = [
-            {"text": "Tümünü Başlat", "command": self.start_all, "color": COLORS["success"], "hover": COLORS["success_hover"]},
-            {"text": "Tümünü Durdur", "command": self.stop_all, "color": COLORS["danger"], "hover": COLORS["danger_hover"]},
-            {"text": "Acil Durdurma", "command": self.emergency_stop, "color": COLORS["danger"], "hover": COLORS["danger_hover"]}
+        
+        self.control_buttons_refs = [] 
+        controls_data = [ # Changed variable name for clarity
+            {"text": "Start All", "command": self.start_all, "color_key": "success", "hover_key": "success_hover"},
+            {"text": "Stop All", "command": self.stop_all, "color_key": "danger", "hover_key": "danger_hover"},
+            {"text": "Emergency Stop", "command": self.emergency_stop, "color_key": "danger", "hover_key": "danger_hover"}
         ]
-        for ctrl in controls:
-            ctk.CTkButton(
-                controls_frame, text=ctrl["text"], command=ctrl["command"], height=38, font=FONTS["button_small"],
-                fg_color=ctrl["color"], hover_color=ctrl["hover"], corner_radius=8
-            ).pack(fill="x", padx=15, pady=5)
-        ctk.CTkButton(
-            parent_sidebar, text="Uygulamadan Çık", command=self.app.quit, height=38, font=FONTS["button_small"],
-            fg_color=COLORS["dark"], hover_color=COLORS["danger_hover"], border_width=1, border_color=COLORS["secondary"],
+        for ctrl_data in controls_data: # Iterate using new variable name
+            btn = ctk.CTkButton(
+                controls_frame, text=ctrl_data["text"], command=ctrl_data["command"], height=38, font=FONTS["button_small"],
+                fg_color=self.colors[ctrl_data["color_key"]], hover_color=self.colors[ctrl_data["hover_key"]], corner_radius=8
+            )
+            btn.pack(fill="x", padx=15, pady=5)
+            self.control_buttons_refs.append(btn)
+        
+        # Tema değiştirme düğmesi eklendi
+        self.theme_button = ctk.CTkButton(
+            parent_sidebar, 
+            text="Change Theme", 
+            command=self.toggle_theme, 
+            height=38, 
+            font=FONTS["button_small"],
+            fg_color=self.colors["secondary"], 
+            hover_color=self.colors["tertiary"],
+            text_color=self.colors["accent"], # MODIFIED: Colored text
             corner_radius=8
-        ).pack(side="bottom", fill="x", padx=15, pady=(10,15))
+        )
+        self.theme_button.pack(fill="x", padx=15, pady=(10, 5))
 
-    def _create_qgc_tools_panel_content(self, parent_panel):
-        ctk.CTkLabel(parent_panel, text="Araçlar", font=FONTS["subtitle"],
-                     text_color=COLORS["text_primary"]).pack(pady=(25,10), padx=10)
-        ctk.CTkButton(parent_panel, text="QGC Başlat",
-                      command=self.start_qgc,
-                      fg_color=COLORS["accent"],
-                      hover_color="#3A7BBF",
-                      font=FONTS["button"],
-                      height=40
-                      ).pack(fill="x", padx=15, pady=10)
+        # Launch QGC Button (Moved here)
+        self.launch_qgc_button = ctk.CTkButton(
+            parent_sidebar,
+            text="Launch QGC",
+            command=self.start_qgc,
+            height=38,
+            font=FONTS["button_small"], # Match style of other buttons in this section
+            fg_color=self.colors["secondary"], # Match theme button's fg_color for visual consistency
+            hover_color=self.colors["tertiary"], # Match theme button's hover
+            text_color=self.colors["accent"], # MODIFIED: Colored text like theme button
+            corner_radius=8
+        )
+        self.launch_qgc_button.pack(fill="x", padx=15, pady=5) # Placed after theme button
 
+        self.exit_button = ctk.CTkButton(
+            parent_sidebar, text="Exit Application", command=self.app.quit, height=38, font=FONTS["button_small"],
+            fg_color=self.colors["dark"], hover_color=self.colors["danger_hover"], border_width=1, border_color=self.colors["secondary"],
+            corner_radius=8
+        )
+        self.exit_button.pack(side="bottom", fill="x", padx=15, pady=(10,15))
+
+    # def _create_qgc_tools_panel_content IS REMOVED
 
     def _create_dashboard_status_widgets(self, parent, initial_text):
-        light = ctk.CTkLabel(parent, text="●", font=("Arial", 22), text_color=COLORS["gray"])
+        light = ctk.CTkLabel(parent, text="●", font=("Arial", 22), text_color=self.colors["gray"])
         light.pack(side="left", padx=(0, 8))
-        label = ctk.CTkLabel(parent, text=initial_text, font=FONTS["small"], text_color=COLORS["text_secondary"])
+        label = ctk.CTkLabel(parent, text=initial_text, font=FONTS["small"], text_color=self.colors["text_secondary"])
         label.pack(side="left")
         return light, label
 
@@ -267,13 +213,15 @@ class DroneControlCenter:
 
         header_content_frame = ctk.CTkFrame(frame, fg_color="transparent")
         header_content_frame.pack(fill="x", padx=25, pady=(25, 15))
-        ctk.CTkLabel(header_content_frame, text="Drone Kontrol Paneli", font=FONTS["title"],
-                     text_color=COLORS["text_primary"]).pack()
+        self.dashboard_header_label = ctk.CTkLabel(header_content_frame, text="Drone Control Panel", font=FONTS["title"],
+                                                   text_color=self.colors["text_primary"])
+        self.dashboard_header_label.pack()
 
         cards_frame = ctk.CTkFrame(frame, fg_color="transparent")
         cards_frame.pack(fill="both", expand=True, padx=15, pady=10)
-        cards_frame.grid_columnconfigure((0, 1), weight=1)
-        cards_frame.grid_rowconfigure(0, weight=1)
+        cards_frame.grid_columnconfigure(0, weight=1)
+        cards_frame.grid_columnconfigure(1, weight=1)
+        cards_frame.grid_rowconfigure(0, weight=1) 
 
         self.create_drone_card(cards_frame, "DRONE 1", drone_id=1, column_idx=0)
         self.create_drone_card(cards_frame, "DRONE 2", drone_id=2, column_idx=1)
@@ -281,57 +229,93 @@ class DroneControlCenter:
 
     def create_drone_card(self, parent, title_text, drone_id, column_idx):
         card = ctk.CTkFrame(
-            parent, fg_color=COLORS["card_bg"], corner_radius=12,
-            border_width=2, border_color=COLORS["gray"],
-            width=CARD_WIDTH_SMALL, height=CARD_HEIGHT_SMALL
+            parent, fg_color=self.colors["card_bg"], corner_radius=12,
+            border_width=2, border_color=self.colors["gray"],
         )
         card.grid(row=0, column=column_idx, padx=12, pady=12, sticky="nsew")
         card.grid_propagate(False)
 
+        # Store title label references directly for easier color update
+        title_label_attr = f"drone{drone_id}_card_title_label"
+        title_label = ctk.CTkLabel(card, text=title_text, font=FONTS["subtitle"], text_color=self.colors["accent"])
+        title_label.pack(pady=(12, 8))
+        setattr(self, title_label_attr, title_label)
+
         if drone_id == 1: self.dash_drone1_card_ref = card
         else: self.dash_drone2_card_ref = card
 
-        ctk.CTkLabel(card, text=title_text, font=FONTS["subtitle"], text_color=COLORS["accent"]
-                     ).pack(pady=(12, 8))
-
-        feed_frame = ctk.CTkFrame(
-            card, width=FEED_WIDTH_SMALL, height=FEED_HEIGHT_SMALL,
-            fg_color=COLORS["dark"], corner_radius=8
-        )
-        feed_frame.pack(pady=(5, 10), padx=10)
-        feed_frame.pack_propagate(False)
+        feed_frame = ctk.CTkFrame(card, fg_color=self.colors["dark"], corner_radius=8)
+        feed_frame.pack(pady=(5, 10), padx=10, fill="both", expand=True)
+        feed_frame.pack_propagate(False) 
 
         image_label = ctk.CTkLabel(feed_frame, text="")
         image_label.pack(expand=True, fill="both")
         self.drone_image_labels[drone_id] = image_label
 
         if self.static_placeholder_ctkimage:
-            # CTkImage.configure ile ImageTk.PhotoImage direkt olarak atanır
             image_label.configure(image=self.static_placeholder_ctkimage, text="")
         else:
-            image_label.configure(text="Yer Tutucu Yok", font=FONTS["small"], text_color=COLORS["warning"])
+            image_label.configure(text="Placeholder N/A", font=FONTS["small"], text_color=self.colors["warning"])
 
+        def resize_image_on_frame_resize(event):
+            if event.width > 0 and event.height > 0:
+                if not self.drone_process_commanded_active[drone_id] or not self.gif_loaded_successfully[drone_id]:
+                    self._load_static_placeholder_images(event.width, event.height)
+                    if self.static_placeholder_ctkimage:
+                        image_label.configure(image=self.static_placeholder_ctkimage, text="")
+                elif self.drone_process_commanded_active[drone_id] and self.gif_loaded_successfully[drone_id]:
+                    if self.drone_gif_ctk_frames[drone_id] and (
+                        event.width != self.drone_gif_ctk_frames[drone_id][0].width() or
+                        event.height != self.drone_gif_ctk_frames[drone_id][0].height()
+                    ):
+                        print(f"INFO: Resizing GIF for Drone {drone_id} to {event.width}x{event.height}")
+                        self._load_gif_frames(drone_id, DRONE_GIF_PATH)
+                        if self.drone_gif_animation_job_id[drone_id]:
+                            self.app.after_cancel(self.drone_gif_animation_job_id[drone_id])
+                            self.drone_gif_animation_job_id[drone_id] = None
+                        self.drone_gif_current_frame_index[drone_id] = 0
+                        self._animate_gif(drone_id)
+        feed_frame.bind("<Configure>", resize_image_on_frame_resize)
 
         status_display_frame = ctk.CTkFrame(card, fg_color="transparent")
         status_display_frame.pack(pady=(8, 8))
         if drone_id == 1:
             self.drone1_dashboard_status_light, self.drone1_dashboard_status_label = \
-                self._create_dashboard_status_widgets(status_display_frame, "PASİF")
+                self._create_dashboard_status_widgets(status_display_frame, "INACTIVE")
         else:
             self.drone2_dashboard_status_light, self.drone2_dashboard_status_label = \
-                self._create_dashboard_status_widgets(status_display_frame, "PASİF")
+                self._create_dashboard_status_widgets(status_display_frame, "INACTIVE")
 
         buttons_control_frame = ctk.CTkFrame(card, fg_color="transparent")
         buttons_control_frame.pack(pady=(8, 12), padx=15, fill="x")
         start_cmd = self.start_drone1 if drone_id == 1 else self.start_drone2
         stop_cmd = self.stop_drone1 if drone_id == 1 else self.stop_drone2
-        self.create_control_button(buttons_control_frame, f"Drone {drone_id} Başlat", start_cmd,
-                                   COLORS["success"], COLORS["success_hover"])
-        self.create_control_button(buttons_control_frame, f"Drone {drone_id} Durdur", stop_cmd,
-                                   COLORS["danger"], COLORS["danger_hover"])
+        
+        self.drone_start_buttons = getattr(self, 'drone_start_buttons', {})
+        self.drone_stop_buttons = getattr(self, 'drone_stop_buttons', {})
+
+        start_btn = self.create_control_button(buttons_control_frame, f"Start Drone {drone_id}", start_cmd,
+                                               self.colors["success"], self.colors["success_hover"])
+        self.drone_start_buttons[drone_id] = start_btn
+
+        stop_btn = self.create_control_button(buttons_control_frame, f"Stop Drone {drone_id}", stop_cmd,
+                                             self.colors["danger"], self.colors["danger_hover"])
+        self.drone_stop_buttons[drone_id] = stop_btn
         return card
 
     def _load_gif_frames(self, drone_id, gif_path):
+        image_label_widget = self.drone_image_labels.get(drone_id)
+        if not image_label_widget:
+            print(f"ERROR: No image label widget found for Drone {drone_id} for GIF loading.")
+            self.gif_loaded_successfully[drone_id] = False
+            return
+
+        current_width = image_label_widget.winfo_width()
+        current_height = image_label_widget.winfo_height()
+        if current_width == 0 or current_height == 0:
+            print(f"WARNING: Image label for Drone {drone_id} has zero dimensions. Using default for GIF.")
+            current_width, current_height = FEED_WIDTH_SMALL, FEED_HEIGHT_SMALL
+
         try:
             pil_gif = Image.open(gif_path)
             self.drone_gif_ctk_frames[drone_id] = []
@@ -339,113 +323,92 @@ class DroneControlCenter:
             for i in range(pil_gif.n_frames):
                 pil_gif.seek(i)
                 pil_frame_copy = pil_gif.copy().convert("RGBA")
-                pil_frame_resized = pil_frame_copy.resize((FEED_WIDTH_SMALL, FEED_HEIGHT_SMALL), Image.Resampling.LANCZOS)
-                # CTkImage yerine ImageTk.PhotoImage kullanın
+                pil_frame_resized = pil_frame_copy.resize((current_width, current_height), Image.Resampling.LANCZOS)
                 self.drone_gif_ctk_frames[drone_id].append(ImageTk.PhotoImage(pil_frame_resized))
                 self.drone_gif_durations[drone_id].append(pil_gif.info.get('duration', 100))
             self.gif_loaded_successfully[drone_id] = True
-            print(f"BİLGİ: Drone {drone_id} için GIF başarıyla yüklendi ({pil_gif.n_frames} kare).")
-        except FileNotFoundError:
-            print(f"HATA: Drone {drone_id} için GIF dosyası bulunamadı: {gif_path}")
-            self.gif_loaded_successfully[drone_id] = False
+            print(f"INFO: GIF loaded for Drone {drone_id} ({pil_gif.n_frames} frames) resized to {current_width}x{current_height}.")
         except Exception as e:
-            print(f"HATA: Drone {drone_id} için GIF yüklenemedi: {e}")
+            print(f"ERROR: Could not load GIF for Drone {drone_id}: {e}")
             self.gif_loaded_successfully[drone_id] = False
-
 
     def _animate_gif(self, drone_id):
-        if not self.drone_process_commanded_active[drone_id] or not self.gif_loaded_successfully[drone_id]:
+        if not self.drone_process_commanded_active[drone_id] or not self.gif_loaded_successfully[drone_id] or not self.drone_gif_ctk_frames[drone_id]:
             if self.drone_gif_animation_job_id[drone_id]:
                 self.app.after_cancel(self.drone_gif_animation_job_id[drone_id])
                 self.drone_gif_animation_job_id[drone_id] = None
-            # Durduğunda statik yer tutucuyu göster
             image_label_widget = self.drone_image_labels.get(drone_id)
             if image_label_widget and self.static_placeholder_ctkimage:
                 image_label_widget.configure(image=self.static_placeholder_ctkimage, text="")
             return
 
-        current_frames = self.drone_gif_ctk_frames[drone_id]
-        if not current_frames: # GIF yüklenememişse animasyonu durdur
-            return
-
         idx = self.drone_gif_current_frame_index[drone_id]
-        
-        image_label_widget = self.drone_image_labels.get(drone_id)
-        if image_label_widget:
-            if idx < len(current_frames):
-                image_label_widget.configure(image=current_frames[idx], text="")
-            else: # Döngüye başa dön
-                self.drone_gif_current_frame_index[drone_id] = 0
-                if current_frames:
-                    image_label_widget.configure(image=current_frames[0], text="")
-
-        self.drone_gif_current_frame_index[drone_id] = (idx + 1) % len(current_frames)
-            
-        duration = self.drone_gif_durations[drone_id][self.drone_gif_current_frame_index[drone_id]] if self.drone_gif_durations[drone_id] else 100
+        self.drone_image_labels[drone_id].configure(image=self.drone_gif_ctk_frames[drone_id][idx], text="")
+        self.drone_gif_current_frame_index[drone_id] = (idx + 1) % len(self.drone_gif_ctk_frames[drone_id])
+        duration = self.drone_gif_durations[drone_id][idx] if self.drone_gif_durations[drone_id] and idx < len(self.drone_gif_durations[drone_id]) else 100
         self.drone_gif_animation_job_id[drone_id] = self.app.after(duration, lambda: self._animate_gif(drone_id))
-
 
     def _populate_telemetry_card_content(self, card_widget, title_text, drone_id):
         title_frame = ctk.CTkFrame(card_widget, fg_color="transparent")
         title_frame.pack(pady=(15, 10), fill="x", padx=20)
-        ctk.CTkLabel(title_frame, text=title_text, font=FONTS["subtitle"], text_color=COLORS["accent"]).pack(side="left")
-        status_label = ctk.CTkLabel(title_frame, text="Durum: BİLİNMİYOR", font=FONTS["small"], text_color=COLORS["gray"])
-        status_label.pack(side="right", padx=(0, 5))
+        
+        # Store references for easier color updates
+        title_label_attr = f"drone{drone_id}_telemetry_title_label"
+        conn_label_attr = f"drone{drone_id}_telemetry_connection_label"
+
+        title_label = ctk.CTkLabel(title_frame, text=title_text, font=FONTS["subtitle"], text_color=self.colors["accent"])
+        title_label.pack(side="left")
+        setattr(self, title_label_attr, title_label)
+        
+        conn_label = ctk.CTkLabel(title_frame, text="Status: UNKNOWN", font=FONTS["small"], text_color=self.colors["gray"])
+        conn_label.pack(side="right", padx=(0, 5))
+        setattr(self, conn_label_attr, conn_label)
         
         data_rows_frame = ctk.CTkFrame(card_widget, fg_color="transparent")
         data_rows_frame.pack(fill="both", expand=True, pady=(5, 15), padx=20)
         telemetry_fields = {
-            "latitude": "Enlem", "longitude": "Boylam", "altitude": "Yükseklik",
-            "speed": "Hız", "battery": "Batarya", "mode": "Uçuş Modu",
-            "pitch": "Pitch Açısı", "roll": "Roll Açısı", "yaw": "Yaw Açısı"
+            "latitude": "Latitude", "longitude": "Longitude", "altitude": "Altitude",
+            "speed": "Speed", "battery": "Battery", "mode": "Flight Mode",
+            "pitch": "Pitch Angle", "roll": "Roll Angle", "yaw": "Yaw Angle"
         }
         current_data_dict = {}
         for key, display_name in telemetry_fields.items():
             current_data_dict[key] = self.create_telemetry_row(data_rows_frame, display_name, "-")
-        if drone_id == 1:
-            self.drone1_telemetry_connection_label = status_label
-            self.drone1_data = current_data_dict
-        else:
-            self.drone2_telemetry_connection_label = status_label
-            self.drone2_data = current_data_dict
-
+        if drone_id == 1: self.drone1_data = current_data_dict
+        else: self.drone2_data = current_data_dict
 
     def create_telemetry_display(self, parent_frame):
         frame = ctk.CTkFrame(parent_frame, fg_color="transparent")
         header = ctk.CTkFrame(frame, fg_color="transparent")
         header.pack(fill="x", padx=25, pady=(25, 15))
-        ctk.CTkLabel(header, text="Canlı Drone Telemetrisi", font=FONTS["title"], text_color=COLORS["text_primary"]).pack(side="left")
+        self.telemetry_header_label = ctk.CTkLabel(header, text="Live Drone Telemetry", font=FONTS["title"], text_color=self.colors["text_primary"])
+        self.telemetry_header_label.pack(side="left")
         
         cards_frame = ctk.CTkFrame(frame, fg_color="transparent")
         cards_frame.pack(fill="both", expand=True, padx=15, pady=10)
-        cards_frame.grid_columnconfigure((0,1), weight=1)
+        cards_frame.grid_columnconfigure(0, weight=1)
+        cards_frame.grid_columnconfigure(1, weight=1)
         cards_frame.grid_rowconfigure(0, weight=1)
 
-        self.drone1_card_ref = ctk.CTkFrame(
-            cards_frame, width=400, height=420, corner_radius=12, fg_color=COLORS["card_bg"],
-            border_color=COLORS["gray"], border_width=2
-        )
+        self.drone1_card_ref = ctk.CTkFrame(cards_frame, corner_radius=12, fg_color=self.colors["card_bg"],
+                                            border_color=self.colors["gray"], border_width=2)
         self.drone1_card_ref.grid(row=0, column=0, padx=12, pady=12, sticky="nsew")
         self.drone1_card_ref.grid_propagate(False)
-        self._populate_telemetry_card_content(self.drone1_card_ref, "Drone 1 Telemetri", drone_id=1)
+        self._populate_telemetry_card_content(self.drone1_card_ref, "Drone 1 Telemetry", drone_id=1)
 
-        self.drone2_card_ref = ctk.CTkFrame(
-            cards_frame, width=400, height=420, corner_radius=12, fg_color=COLORS["card_bg"],
-            border_color=COLORS["gray"], border_width=2
-        )
+        self.drone2_card_ref = ctk.CTkFrame(cards_frame, corner_radius=12, fg_color=self.colors["card_bg"],
+                                            border_color=self.colors["gray"], border_width=2)
         self.drone2_card_ref.grid(row=0, column=1, padx=12, pady=12, sticky="nsew")
         self.drone2_card_ref.grid_propagate(False)
-        self._populate_telemetry_card_content(self.drone2_card_ref, "Drone 2 Telemetri", drone_id=2)
+        self._populate_telemetry_card_content(self.drone2_card_ref, "Drone 2 Telemetry", drone_id=2)
         return frame
 
     def create_telemetry_row(self, parent, label, value):
         row_frame = ctk.CTkFrame(parent, fg_color="transparent", height=30)
         row_frame.pack(fill="x", padx=5, pady=3)
-        ctk.CTkLabel(
-            row_frame, text=f"{label}:", font=FONTS["body"], text_color=COLORS["text_secondary"],
-            width=130, anchor="w"
-        ).pack(side="left", padx=(0,8))
-        value_label = ctk.CTkLabel(row_frame, text=value, font=FONTS["body"], text_color=COLORS["text_primary"], anchor="w")
+        ctk.CTkLabel(row_frame, text=f"{label}:", font=FONTS["body"], text_color=self.colors["text_secondary"],
+                     width=130, anchor="w").pack(side="left", padx=(0,8))
+        value_label = ctk.CTkLabel(row_frame, text=value, font=FONTS["body"], text_color=self.colors["text_primary"], anchor="w")
         value_label.pack(side="left", expand=True, fill="x")
         return value_label
 
@@ -457,21 +420,126 @@ class DroneControlCenter:
         self.dashboard_frame.pack_forget()
         self.telemetry_frame.pack(fill="both", expand=True)
 
+    def toggle_theme(self):
+        if self.current_theme == "dark":
+            ctk.set_appearance_mode("light")
+            self.current_theme = "light"
+            self.colors = COLORS_LIGHT
+            print("Tema: AÇIK")
+        else:
+            ctk.set_appearance_mode("dark")
+            self.current_theme = "dark"
+            self.colors = COLORS_DARK
+            print("Tema: KOYU")
+        self.update_ui_colors()
+
+    def update_ui_colors(self):
+        self.nav_sidebar.configure(fg_color=self.colors["primary"])
+        # self.qgc_tools_panel.configure(fg_color=self.colors["secondary"]) # REMOVED
+        self.main_content_area.configure(fg_color=self.colors["dark"])
+
+        for widget in self.logo_frame.winfo_children():
+            if isinstance(widget, ctk.CTkLabel):
+                widget.configure(text_color=self.colors["accent"] if "SwarMind" in widget.cget("text") else self.colors["text_primary"])
+
+        for btn in self.nav_button_refs:
+            btn.configure(hover_color=self.colors["secondary"], text_color=self.colors["text_primary"])
+        
+        if hasattr(self, 'system_controls_title_label'): # Check if label exists
+            self.system_controls_title_label.configure(text_color=self.colors["text_secondary"])
+
+        for i, btn in enumerate(self.control_buttons_refs):
+            # Assuming specific order for Start All, Stop All, Emergency Stop
+            if i == 0: # Start All
+                btn.configure(fg_color=self.colors["success"], hover_color=self.colors["success_hover"])
+            elif i == 1 or i == 2: # Stop All, Emergency Stop
+                btn.configure(fg_color=self.colors["danger"], hover_color=self.colors["danger_hover"])
+        
+        self.theme_button.configure(fg_color=self.colors["secondary"], hover_color=self.colors["tertiary"], text_color=self.colors["accent"])
+        
+        # Update Launch QGC button colors
+        if hasattr(self, 'launch_qgc_button'): # Check if it has been created
+            self.launch_qgc_button.configure(
+                fg_color=self.colors["secondary"], 
+                hover_color=self.colors["tertiary"], 
+                text_color=self.colors["accent"]
+            )
+
+        self.exit_button.configure(fg_color=self.colors["dark"], hover_color=self.colors["danger_hover"], border_color=self.colors["secondary"])
+
+        # self.qgc_label.configure(text_color=self.colors["text_primary"]) # REMOVED
+        # self.qgc_button.configure(fg_color=self.colors["accent"], hover_color="#3A7BBF") # REMOVED (now self.launch_qgc_button)
+
+        self.dashboard_header_label.configure(text_color=self.colors["text_primary"])
+        
+        for i in [1, 2]:
+            dash_card = getattr(self, f"dash_drone{i}_card_ref", None)
+            dash_title = getattr(self, f"drone{i}_card_title_label", None)
+            if dash_card: dash_card.configure(fg_color=self.colors["card_bg"], border_color=self.colors.get("gray", "#6c757d"))
+            if dash_title: dash_title.configure(text_color=self.colors["accent"])
+
+            # Update feed frame background and placeholder text color
+            if self.drone_image_labels[i]:
+                feed_frame = self.drone_image_labels[i].master # Get parent CTkFrame
+                if isinstance(feed_frame, ctk.CTkFrame): # Ensure it's the feed_frame
+                    feed_frame.configure(fg_color=self.colors["dark"])
+                # Check if placeholder text needs color update
+                if self.drone_image_labels[i].cget("image") == "" and "Placeholder N/A" in self.drone_image_labels[i].cget("text"):
+                    self.drone_image_labels[i].configure(text_color=self.colors["warning"])
+
+            start_btn = self.drone_start_buttons.get(i)
+            stop_btn = self.drone_stop_buttons.get(i)
+            if start_btn: start_btn.configure(fg_color=self.colors["success"], hover_color=self.colors["success_hover"])
+            if stop_btn: stop_btn.configure(fg_color=self.colors["danger"], hover_color=self.colors["danger_hover"])
+
+        self.telemetry_header_label.configure(text_color=self.colors["text_primary"])
+        for i in [1, 2]:
+            tel_card = getattr(self, f"drone{i}_card_ref", None) # Telemetry view card
+            tel_title = getattr(self, f"drone{i}_telemetry_title_label", None)
+            tel_conn = getattr(self, f"drone{i}_telemetry_connection_label", None)
+            if tel_card:
+                tel_card.configure(fg_color=self.colors["card_bg"], border_color=self.colors.get("gray", "#6c757d"))
+                self._update_telemetry_row_colors(tel_card)
+            if tel_title: tel_title.configure(text_color=self.colors["accent"])
+            # Connection label color is updated in _update_telemetry_card_visuals
+        
+        self._update_telemetry_card_visuals(1, self.drone1_data if self.is_drone_connected_via_telemetry[1] else {}) 
+        self._update_telemetry_card_visuals(2, self.drone2_data if self.is_drone_connected_via_telemetry[2] else {})
+
+    def _update_telemetry_row_colors(self, card_widget):
+        for child_frame in card_widget.winfo_children():
+            if isinstance(child_frame, ctk.CTkFrame) and child_frame.cget("fg_color") == "transparent": 
+                for row_frame in child_frame.winfo_children():
+                    if isinstance(row_frame, ctk.CTkFrame) and row_frame.cget("fg_color") == "transparent":
+                        labels_in_row = row_frame.winfo_children()
+                        if len(labels_in_row) >= 1 and isinstance(labels_in_row[0], ctk.CTkLabel) and labels_in_row[0].cget("text").endswith(":"):
+                            labels_in_row[0].configure(text_color=self.colors["text_secondary"])
+                        if len(labels_in_row) >= 2 and isinstance(labels_in_row[1], ctk.CTkLabel):
+                             # Value color is primarily handled by update_telemetry_data_labels/clear
+                            if labels_in_row[1].cget("text") == "-" or labels_in_row[1].cget("text").startswith("-"):
+                                labels_in_row[1].configure(text_color=self.colors["text_primary"])
+
+
     def handle_drone_process_command(self, drone_id, start_process):
         self.drone_process_commanded_active[drone_id] = start_process
-        
-        if not start_process:
-            # Durdurulursa bağlantı durumunu sıfırla
-            self.is_drone_connected_via_telemetry[drone_id] = False
-        
-        self.last_telemetry_update_time[drone_id] = 0.0 # Yeni bir timeout döngüsü başlatmak için sıfırla
+        if not start_process: self.is_drone_connected_via_telemetry[drone_id] = False
+        self.last_telemetry_update_time[drone_id] = 0.0 
 
         if start_process:
-            print(f"Drone {drone_id} işlemleri başlatılmaya çalışılıyor...")
-            command_key = "drone1" if drone_id == 1 else "drone2"
-            subprocess.Popen(self.commands[command_key], shell=True, text=True)
+            print(f"Attempting to start Drone {drone_id} processes...")
+            command_key = f"drone{drone_id}" # Simplified command key
+            subprocess.Popen(COMMANDS[command_key], shell=True, text=True)
 
-            if not self.drone_gif_ctk_frames[drone_id] or not self.gif_loaded_successfully[drone_id]:
+            current_width = self.drone_image_labels[drone_id].winfo_width()
+            current_height = self.drone_image_labels[drone_id].winfo_height()
+            if not self.gif_loaded_successfully[drone_id] or (
+                current_width > 0 and current_height > 0 and (
+                (self.drone_gif_ctk_frames[drone_id] and \
+                (current_width != self.drone_gif_ctk_frames[drone_id][0].width() or \
+                 current_height != self.drone_gif_ctk_frames[drone_id][0].height())) or \
+                 not self.drone_gif_ctk_frames[drone_id] 
+                )
+            ):
                 self._load_gif_frames(drone_id, DRONE_GIF_PATH)
             
             if self.gif_loaded_successfully[drone_id]:
@@ -485,33 +553,23 @@ class DroneControlCenter:
                     if self.static_placeholder_ctkimage:
                         image_label_widget.configure(image=self.static_placeholder_ctkimage, text="")
                     else:
-                        image_label_widget.configure(text="Görüntü Y/A", image=None)
-
-
-        else: # İşlemi durdur
-            print(f"Drone {drone_id} işlemleri durdurulmaya çalışılıyor...")
-            # Tmux oturumlarını ve ilgili Python scriptlerini durdurma komutları
-            if drone_id == 1:
-                subprocess.call("tmux kill-session -t drone1_session 2>/dev/null", shell=True)
-                subprocess.call("tmux kill-session -t drone1_py 2>/dev/null", shell=True)
-            else:
-                subprocess.call("tmux kill-session -t drone2_session 2>/dev/null", shell=True)
-                subprocess.call("tmux kill-session -t drone2_py 2>/dev/null", shell=True)
+                        image_label_widget.configure(text="Image N/A", image=None)
+        else: 
+            print(f"Attempting to stop Drone {drone_id} processes...")
+            subprocess.call(f"tmux kill-session -t drone{drone_id}_session 2>/dev/null", shell=True)
+            subprocess.call(f"tmux kill-session -t drone{drone_id}_py 2>/dev/null", shell=True)
 
             if self.drone_gif_animation_job_id[drone_id]:
                 self.app.after_cancel(self.drone_gif_animation_job_id[drone_id])
                 self.drone_gif_animation_job_id[drone_id] = None
             
-            # Animasyon durunca statik yer tutucuyu göster
             image_label_widget = self.drone_image_labels.get(drone_id)
             if image_label_widget:
                 if self.static_placeholder_ctkimage:
                     image_label_widget.configure(image=self.static_placeholder_ctkimage, text="")
                 else:
-                    image_label_widget.configure(text="Görüntü Durdu", image=None)
-
-        self._update_telemetry_card_visuals(drone_id)
-
+                    image_label_widget.configure(text="Image Stopped", image=None)
+        self._update_telemetry_card_visuals(drone_id, {}) 
 
     def start_drone1(self): self.handle_drone_process_command(1, True)
     def stop_drone1(self): self.handle_drone_process_command(1, False)
@@ -519,95 +577,74 @@ class DroneControlCenter:
     def stop_drone2(self): self.handle_drone_process_command(2, False)
 
     def start_qgc(self):
-        print("QGroundControl başlatılıyor...")
-        subprocess.Popen(self.commands["qgc"], shell=True, text=True)
+        print("Launching QGroundControl...")
+        subprocess.Popen(COMMANDS["qgc"], shell=True, text=True)
 
     def start_all(self):
-        print("Tüm sistemler başlatılıyor...")
+        print("Starting all systems...")
         self.start_drone1()
-        self.app.after(2000, self.start_drone2) # Drone 2'yi biraz gecikmeli başlat
-        self.app.after(7000, self.start_qgc) # QGC'yi daha da gecikmeli başlat
+        self.app.after(2000, self.start_drone2) 
+        self.app.after(7000, self.start_qgc) 
 
     def stop_all(self):
-        print("Tüm drone sistemleri durduruluyor...")
+        print("Stopping all drone systems...")
         self.stop_drone1()
         self.stop_drone2()
-        # QGC'yi de durdurmak isterseniz bu satırı etkinleştirin:
-        # subprocess.call("pkill QGroundControl", shell=True)
 
     def emergency_stop(self):
-        print("ACİL DURDURMA AKTİF!")
+        print("EMERGENCY STOP ACTIVE!")
         self.stop_all()
-        # Ek acil durum işlemleri buraya eklenebilir
 
     def read_shared_memory(self):
         try:
-            # Paylaşımlı belleğe bağlan
             telemetry_shm = shm.SharedMemory(name=SHM_NAME, create=False, size=SHM_SIZE)
-            raw_bytes = bytes(telemetry_shm.buf[:])
-            
-            # Null karakteri bul ve ondan öncesini al
-            try:
-                null_index = raw_bytes.index(b'\x00')
-                decoded_str = raw_bytes[:null_index].decode('utf-8', errors='ignore')
-            except ValueError: # Null karakter yoksa tüm belleği kullan
-                decoded_str = raw_bytes.decode('utf-8', errors='ignore').rstrip('\x00')
-            
+            raw_bytes = bytearray(telemetry_shm.buf)
+            try: null_index = raw_bytes.index(0) 
+            except ValueError: null_index = len(raw_bytes) # Read all if no null byte
+            decoded_str = raw_bytes[:null_index].decode('utf-8', errors='ignore').rstrip('\x00')
             telemetry_shm.close()
-            # JSON'ı parse et. Eğer boş bir stringse None dön.
             return json.loads(decoded_str) if decoded_str.strip() else {}
-        except FileNotFoundError:
-            # print(f"Paylaşımlı bellek '{SHM_NAME}' bulunamadı. Telemetry script'lerinin çalıştığından emin olun.")
-            return None
-        except json.JSONDecodeError as e:
-            # print(f"Paylaşımlı bellek JSON decode hatası: {e} - Raw: '{decoded_str}'")
-            return None
-        except Exception as e:
-            # print(f"Paylaşımlı bellek okunurken beklenmeyen hata: {e}")
-            return None
+        except FileNotFoundError: return None
+        except json.JSONDecodeError: return None
+        except Exception: return None
 
-
+    # Telemetry data display keys are corrected in this version
     def update_telemetry_data_labels(self, card_data_labels, telemetry):
-        if telemetry and card_data_labels:
-            # Telemetri verilerini güncelle
+        telemetry = telemetry if isinstance(telemetry, dict) else {}
+        if card_data_labels:
             lat_text = f"{telemetry.get('latitude', 0.0):.6f}" if isinstance(telemetry.get('latitude'), (float, int)) else "-"
             lon_text = f"{telemetry.get('longitude', 0.0):.6f}" if isinstance(telemetry.get('longitude'), (float, int)) else "-"
-            alt_raw = telemetry.get('absolute_altitude', telemetry.get('altitude', "-")) # absolute_altitude_m yerine absolute_altitude
+            alt_raw = telemetry.get('absolute_altitude', telemetry.get('altitude', "-")) 
             alt_text = f"{alt_raw:.2f} m" if isinstance(alt_raw, (float, int)) else f"{alt_raw} m"
 
-            card_data_labels.get("latitude", ctk.CTkLabel(None)).configure(text=lat_text)
-            card_data_labels.get("longitude", ctk.CTkLabel(None)).configure(text=lon_text)
-            card_data_labels.get("altitude", ctk.CTkLabel(None)).configure(text=alt_text)
+            card_data_labels.get("latitude").configure(text=lat_text, text_color=self.colors["text_primary"])
+            card_data_labels.get("longitude").configure(text=lon_text, text_color=self.colors["text_primary"])
+            card_data_labels.get("altitude").configure(text=alt_text, text_color=self.colors["text_primary"])
             
-            speed_val = telemetry.get('speed', '-') # ground_speed_m_s yerine speed
+            speed_val = telemetry.get('speed', '-') 
             speed_text = f"{speed_val:.2f} m/s" if isinstance(speed_val, (float, int)) else f"{speed_val} m/s"
-            card_data_labels.get("speed", ctk.CTkLabel(None)).configure(text=speed_text)
+            card_data_labels.get("speed").configure(text=speed_text, text_color=self.colors["text_primary"])
             
-            battery_val = telemetry.get('battery_percent', None) # battery_remaining yerine battery_percent
+            battery_val = telemetry.get('battery_percent', None) 
             battery_text = "-%"
-            if isinstance(battery_val, (float, int)) and battery_val is not None:
-                battery_text = f"{battery_val:.0f}%" # Zaten 0-100 arası geliyor
-            elif battery_val is not None and str(battery_val).replace('.', '', 1).isdigit():
-                battery_text = f"{float(battery_val):.0f}%"
-            elif battery_val is not None:
-                battery_text = str(battery_val)
+            if isinstance(battery_val, (float, int)) and battery_val is not None: battery_text = f"{battery_val:.0f}%"
+            elif battery_val is not None and str(battery_val).replace('.', '', 1).isdigit(): battery_text = f"{float(battery_val):.0f}%"
+            elif battery_val is not None: battery_text = str(battery_val)
+            card_data_labels.get("battery").configure(text=battery_text, text_color=self.colors["text_primary"])
 
-            card_data_labels.get("battery", ctk.CTkLabel(None)).configure(text=battery_text)
-
-            card_data_labels.get("mode", ctk.CTkLabel(None)).configure(text=f"{telemetry.get('flight_mode', '-')}")
+            card_data_labels.get("mode").configure(text=f"{telemetry.get('flight_mode', '-')}", text_color=self.colors["text_primary"])
             
-            pitch_val = telemetry.get('pitch', '-') # pitch_deg yerine pitch
+            pitch_val = telemetry.get('pitch', '-') 
             pitch_text = f"{pitch_val:.2f}°" if isinstance(pitch_val, (float, int)) else f"{pitch_val}°"
-            card_data_labels.get("pitch", ctk.CTkLabel(None)).configure(text=pitch_text)
+            card_data_labels.get("pitch").configure(text=pitch_text, text_color=self.colors["text_primary"])
 
-            roll_val = telemetry.get('roll', '-') # roll_deg yerine roll
+            roll_val = telemetry.get('roll', '-') 
             roll_text = f"{roll_val:.2f}°" if isinstance(roll_val, (float, int)) else f"{roll_val}°"
-            card_data_labels.get("roll", ctk.CTkLabel(None)).configure(text=roll_text)
+            card_data_labels.get("roll").configure(text=roll_text, text_color=self.colors["text_primary"])
 
-            yaw_val = telemetry.get('yaw', '-') # yaw_deg yerine yaw
+            yaw_val = telemetry.get('yaw', '-') 
             yaw_text = f"{yaw_val:.2f}°" if isinstance(yaw_val, (float, int)) else f"{yaw_val}°"
-            card_data_labels.get("yaw", ctk.CTkLabel(None)).configure(text=yaw_text)
-
+            card_data_labels.get("yaw").configure(text=yaw_text, text_color=self.colors["text_primary"])
 
     def _clear_telemetry_data_labels(self, card_data_labels):
         if card_data_labels:
@@ -617,116 +654,93 @@ class DroneControlCenter:
             }
             for key, label_widget in card_data_labels.items():
                 if label_widget and isinstance(label_widget, ctk.CTkLabel):
-                    label_widget.configure(text=default_texts.get(key, "-"))
+                    label_widget.configure(text=default_texts.get(key, "-"), text_color=self.colors["text_primary"])
 
-
-    def _update_telemetry_card_visuals(self, drone_id):
-        dash_light, dash_label = (self.drone1_dashboard_status_light, self.drone1_dashboard_status_label) if drone_id == 1 else \
+    def _update_telemetry_card_visuals(self, drone_id, current_telemetry_data):
+        dash_light_ref, dash_label_ref = (self.drone1_dashboard_status_light, self.drone1_dashboard_status_label) if drone_id == 1 else \
                                  (self.drone2_dashboard_status_light, self.drone2_dashboard_status_label)
         
-        telemetry_view_card_widget = self.drone1_card_ref if drone_id == 1 else self.drone2_card_ref
-        telemetry_conn_label = self.drone1_telemetry_connection_label if drone_id == 1 else self.drone2_telemetry_connection_label
-        
-        dashboard_card_widget = self.dash_drone1_card_ref if drone_id == 1 else self.dash_drone2_card_ref
-        current_data_labels = self.drone1_data if drone_id == 1 else self.drone2_data
+        tel_view_card_widget = getattr(self, f"drone{drone_id}_card_ref", None)
+        tel_conn_label_widget = getattr(self, f"drone{drone_id}_telemetry_connection_label", None)
+        dashboard_card_widget = getattr(self, f"dash_drone{drone_id}_card_ref", None)
+        current_data_labels_dict = getattr(self, f"drone{drone_id}_data", {})
 
-        # Dashboard kartı için varsayılanlar (PASİF durumu)
-        dash_status_text = "PASİF"
-        dash_light_color = COLORS["gray"]
-        dash_text_color = COLORS["text_secondary"]
-        border_color = COLORS["gray"] # Başlangıçta gri sınır
+        status_text, light_color_key, text_color_key, border_color_key = "INACTIVE", "gray", "text_secondary", "gray"
 
         if self.drone_process_commanded_active[drone_id]:
             if self.is_drone_connected_via_telemetry[drone_id]:
-                dash_status_text = "AKTİF"
-                dash_light_color = COLORS["success"]
-                dash_text_color = COLORS["success"]
-                border_color = COLORS["success"]
-            else: # Veri bekleniyor veya zaman aşımına uğradı
-                dash_status_text = "BAĞLANTI BEKLENİYOR" # Daha açıklayıcı
-                dash_light_color = COLORS["warning"]
-                dash_text_color = COLORS["warning"]
-                border_color = COLORS["warning"]
-        else: # Süreç aktif değilse bağlantı kesik
-            dash_status_text = "BAĞLANTI KESİK"
-            dash_light_color = COLORS["disconnected"]
-            dash_text_color = COLORS["text_secondary"]
-            border_color = COLORS["gray"]
+                status_text, light_color_key, text_color_key, border_color_key = "ACTIVE", "success", "success", "success"
+            else: 
+                status_text, light_color_key, text_color_key, border_color_key = "AWAITING DATA", "warning", "warning", "warning"
+        else: 
+            status_text, light_color_key, text_color_key, border_color_key = "DISCONNECTED", "disconnected", "text_secondary", "gray"
             
-        if dash_light: dash_light.configure(text_color=dash_light_color)
-        if dash_label: dash_label.configure(text=dash_status_text, text_color=dash_text_color)
-        if dashboard_card_widget: dashboard_card_widget.configure(border_color=border_color)
+        if dash_light_ref: dash_light_ref.configure(text_color=self.colors.get(light_color_key, self.colors["gray"]))
+        if dash_label_ref: dash_label_ref.configure(text=status_text.upper(), text_color=self.colors.get(text_color_key, self.colors["text_secondary"]))
+        if dashboard_card_widget: dashboard_card_widget.configure(border_color=self.colors.get(border_color_key, self.colors["gray"]))
+        if tel_view_card_widget: tel_view_card_widget.configure(border_color=self.colors.get(border_color_key, self.colors["gray"]))
         
-        # Telemetri görünümü kartı için
-        if telemetry_view_card_widget: telemetry_view_card_widget.configure(border_color=border_color)
-        
-        if telemetry_conn_label:
-            conn_text = "Durum: BAĞLANTI KESİK" # Process aktif değilse
-            conn_color = COLORS["text_secondary"]
+        if tel_conn_label_widget:
+            conn_disp_text = "Status: DISCONNECTED"
+            conn_disp_color = self.colors["text_secondary"]
             if self.drone_process_commanded_active[drone_id]:
-                conn_text = "Durum: BAĞLI" if self.is_drone_connected_via_telemetry[drone_id] else "Durum: TELEMETRİ YOK"
-                conn_color = COLORS["success"] if self.is_drone_connected_via_telemetry[drone_id] else COLORS["warning"]
-            telemetry_conn_label.configure(text=conn_text, text_color=conn_color)
+                conn_disp_text = "Status: CONNECTED" if self.is_drone_connected_via_telemetry[drone_id] else "Status: NO TELEMETRY"
+                conn_disp_color = self.colors["success"] if self.is_drone_connected_via_telemetry[drone_id] else self.colors["warning"]
+            tel_conn_label_widget.configure(text=conn_disp_text, text_color=conn_disp_color)
 
-        # Eğer süreç aktif değilse veya bağlı değilse telemetri verilerini temizle
-        if not self.drone_process_commanded_active[drone_id] or \
-           (self.drone_process_commanded_active[drone_id] and not self.is_drone_connected_via_telemetry[drone_id]):
-            self._clear_telemetry_data_labels(current_data_labels)
-
+        if self.drone_process_commanded_active[drone_id] and self.is_drone_connected_via_telemetry[drone_id]:
+            self.update_telemetry_data_labels(current_data_labels_dict, current_telemetry_data)
+        else:
+            self._clear_telemetry_data_labels(current_data_labels_dict)
 
     def update_telemetry(self):
         shared_data = self.read_shared_memory()
         now = time.time()
-        
-        # Bu döngüde hangi drone'lardan veri geldiğini takip et
-        drone_data_received_this_cycle = {1: False, 2: False}
+        data_received_this_cycle = {1: False, 2: False}
 
         if shared_data:
-            # Paylaşımlı bellekteki her drone'un verisini işle
             for drone_id_str, telemetry_content in shared_data.items():
                 try:
                     drone_id = int(drone_id_str)
                     if drone_id in [1, 2]:
-                        target_data_dict = self.drone1_data if drone_id == 1 else self.drone2_data
-                        self.update_telemetry_data_labels(target_data_dict, telemetry_content)
-                        self.last_telemetry_update_time[drone_id] = now
-                        if self.drone_process_commanded_active[drone_id]:
-                            self.is_drone_connected_via_telemetry[drone_id] = True
-                        drone_data_received_this_cycle[drone_id] = True
+                        if self.drone_process_commanded_active[drone_id]: # Only process if active
+                            self.is_drone_connected_via_telemetry[drone_id] = True 
+                            self.last_telemetry_update_time[drone_id] = now
+                            # Pass the actual telemetry content for this drone
+                            self._update_telemetry_card_visuals(drone_id, telemetry_content) 
+                        data_received_this_cycle[drone_id] = True # Mark data was present in SHM
                 except ValueError:
-                    print(f"Paylaşımlı bellekte geçersiz drone_id formatı: {drone_id_str}")
+                    print(f"Invalid drone_id format in shared memory: {drone_id_str}")
 
-        # Her drone için bağlantı durumunu kontrol et
         for did in [1, 2]:
             if self.drone_process_commanded_active[did]:
-                if not drone_data_received_this_cycle[did]: # Bu döngüde veri gelmediyse
-                    if self.last_telemetry_update_time[did] > 0 and \
-                       (now - self.last_telemetry_update_time[did] > TIMEOUT_THRESHOLD):
-                        if self.is_drone_connected_via_telemetry[did]: # Daha önce bağlıydıysa zaman aşımı uyarısı
-                            print(f"Drone {did} telemetrisi zaman aşımına uğradı.")
+                # If active, but no data received for it in this cycle from SHM
+                if not data_received_this_cycle[did] and self.is_drone_connected_via_telemetry[did]: 
+                    # And if it was previously connected and timeout exceeded
+                    if (now - self.last_telemetry_update_time[did] > TIMEOUT_THRESHOLD):
+                        print(f"Drone {did} telemetry timed out.")
                         self.is_drone_connected_via_telemetry[did] = False
-                    elif self.last_telemetry_update_time[did] == 0.0: # İlk defa başlatılıp henüz hiç veri gelmediyse
-                        self.is_drone_connected_via_telemetry[did] = False # Bağlı değil olarak işaretle
-            else: # Süreç aktif değilse, bağlantı da kesik
-                self.is_drone_connected_via_telemetry[did] = False
-
-            self._update_telemetry_card_visuals(did)
+                        self._update_telemetry_card_visuals(did, {}) # Update visuals to show timeout
+                # If active but not connected (e.g. awaiting first data, or already timed out)
+                elif not self.is_drone_connected_via_telemetry[did]:
+                     self._update_telemetry_card_visuals(did, {}) # Ensure visuals reflect "AWAITING" or "NO TELEMETRY"
+            else: # If drone is not commanded to be active
+                if self.is_drone_connected_via_telemetry[did]: # If it was somehow marked connected, correct it
+                    self.is_drone_connected_via_telemetry[did] = False
+                self._update_telemetry_card_visuals(did, {}) # Update visuals to "DISCONNECTED"
             
-        self.app.after(1000, self.update_telemetry)
+        self.app.after(500, self.update_telemetry)
 
     def run(self):
         self.app.mainloop()
 
 if __name__ == "__main__":
-    from PIL import ImageFont # Font için Pillow'dan ImageFont'ı ekledik
     try:
-        # Mevcut paylaşımlı bellek segmentini bulmaya çalış
-        # Eğer bulunamazsa, telemetry script'lerinin henüz başlatılmadığı anlamına gelir.
         existing_shm = shm.SharedMemory(name=SHM_NAME, create=False, size=SHM_SIZE)
         existing_shm.close()
-        print(f"BİLGİ: Paylaşımlı bellek '{SHM_NAME}' bulundu.")
+        print(f"INFO: Shared memory '{SHM_NAME}' found.")
     except FileNotFoundError:
-        print(f"BİLGİ: Paylaşımlı bellek '{SHM_NAME}' bulunamadı. Telemetry script'inin (yazıcı) çalıştığından ve oluşturduğundan emin olun.")
+        print(f"INFO: Shared memory '{SHM_NAME}' not found. Ensure the telemetry script (writer) is running and has created it.")
     
     app_instance = DroneControlCenter()
     app_instance.run()
