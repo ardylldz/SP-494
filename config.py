@@ -118,25 +118,32 @@ FONTS = {
 
 # Commands - MODIFIED TO PREVENT NEW TERMINAL WINDOWS
 COMMANDS = {
-    # QGC command: Removed gnome-terminal. QGroundControl.AppImage typically runs as a GUI.
-    # If QGC itself opens a terminal, that's external to this script.
-    "qgc": "cd ~/PX4-Autopilot || exit 1; ./QGroundControl.AppImage",
-    
-    # Drone 1 command: Removed gnome-terminal, running tmux commands directly.
+    # QGroundControl'u başlat
+    "qgc": """
+        cd ~/PX4-Autopilot || exit 1;
+        export LIBGL_ALWAYS_SOFTWARE=1;
+        ./QGroundControl.AppImage
+    """,
+
+    # Drone 1 başlatma (pozisyon verilmediği için varsayılan pozisyonda)
     "drone1": """
         cd ~/PX4-Autopilot || exit 1;
+        export LIBGL_ALWAYS_SOFTWARE=1;
         tmux kill-session -t drone1_session 2>/dev/null;
-        tmux new-session -d -s drone1_session "PX4_SYS_AUTOSTART=4002 PX4_SIM_MODEL=gz_x500 ./build/px4_sitl_default/bin/px4 -i 1";
+        tmux new-session -d -s drone1_session "PX4_SYS_AUTOSTART=4001 PX4_SIM_MODEL=gz_x500_mono_cam PX4_GZ_WORLD=baylands ./build/px4_sitl_default/bin/px4 -i 1";
+        sleep 30;
         tmux kill-session -t drone1_py 2>/dev/null;
-        tmux new-session -d -s drone1_py "python3 ~/Masaüstü/ucak1.py"
+        tmux new-session -d -s drone1_py "python3 /home/arda/Masaüstü/Drone1_bayland.py"
     """,
-    # Drone 2 command: Removed gnome-terminal, running tmux commands directly.
+
+    # Drone 2 başlatma (pozisyon: 0,10)
     "drone2": """
         cd ~/PX4-Autopilot || exit 1;
-        sleep 5;
+        export LIBGL_ALWAYS_SOFTWARE=1;
         tmux kill-session -t drone2_session 2>/dev/null;
-        tmux new-session -d -s drone2_session "PX4_SYS_AUTOSTART=4002 PX4_GZ_MODEL_POSE=\\"0,10,0,0,0,0\\" PX4_SIM_MODEL=gz_x500 ./build/px4_sitl_default/bin/px4 -i 2";
+        tmux new-session -d -s drone2_session "PX4_SYS_AUTOSTART=4001 PX4_SIM_MODEL=gz_x500_mono_cam PX4_GZ_WORLD=baylands PX4_GZ_MODEL_POSE='0,10' ./build/px4_sitl_default/bin/px4 -i 2";
+        sleep 30;
         tmux kill-session -t drone2_py 2>/dev/null;
-        tmux new-session -d -s drone2_py "python3 ~/Masaüstü/ucak2.py"
+        tmux new-session -d -s drone2_py "python3 /home/arda/Masaüstü/Drone2_bayland.py"
     """
 }
