@@ -61,7 +61,6 @@ async def telemetry_collector(drone, drone_id, telemetry_shm):
             async with lock:
                 try:
                     raw = bytes(telemetry_shm.buf[:]).split(b'\x00', 1)[0]
-                    # --- JSON bozuksa temizle ---
                     try:
                         current = json.loads(raw.decode("utf-8")) if raw else {}
                     except Exception:
@@ -90,13 +89,15 @@ async def telemetry_collector(drone, drone_id, telemetry_shm):
 
 async def flocking_controller(drone_id, drone, telemetry_shm):
     ESCAPE_DISTANCE = 10
-    ESCAPE_SPEED = 3.5   # Daha hızlı kaçınma
-    FLOCK_SPEED = 1.2    # Flocking sırasında biraz daha hızlı
-    NORMAL_SPEED = 0.8
+    TARGET_DISTANCE = 15   # Sabit mesafe hedefi (kohezyon)
+    COHESION_SPEED = 1.2   # Kohezyon/sabit mesafe yaklaşma hızı
+    ESCAPE_SPEED = 3.5     # Kaçınma hızı
+    NORMAL_SPEED = 0.8     # Serbest uçuş hızı
+
     while True:
         try:
-            # SHM'den okuma işlemi
-            for _ in range(3):  # 3 denemeye kadar retry
+            # SHM'den oku
+            for _ in range(3):
                 try:
                     raw = bytes(telemetry_shm.buf[:]).split(b'\x00', 1)[0]
                     all_data = json.loads(raw.decode("utf-8")) if raw else {}
@@ -115,42 +116,58 @@ async def flocking_controller(drone_id, drone, telemetry_shm):
                 continue
 
             my_lat, my_lon, my_yaw = my.get("latitude"), my.get("longitude"), my.get("yaw")
-
             others = [d for oid, d in all_data.items() if oid != drone_id and "latitude" in d]
             if not others:
                 await drone.offboard.set_velocity_ned(VelocityNedYaw(NORMAL_SPEED, 0.0, 0.0, my_yaw or 0))
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.05)
                 continue
 
+            # En yakın drone
             nearest = min(
                 others,
                 key=lambda o: calculate_distance(my_lat, my_lon, o["latitude"], o["longitude"])
             )
             dist = calculate_distance(my_lat, my_lon, nearest["latitude"], nearest["longitude"])
+            yaw_to_other = math.degrees(math.atan2(nearest["longitude"] - my_lon, nearest["latitude"] - my_lat))
 
             if dist < ESCAPE_DISTANCE:
                 print(f"{RED}🚨 Kaçınma: {dist:.1f}m{ENDC}")
-                # Kaçınma vektörü ile hızlı çekilme
+                # Kaçınma vektörü
                 angle = math.atan2(my_lon - nearest["longitude"], my_lat - nearest["latitude"])
                 vx = ESCAPE_SPEED * math.cos(angle)
                 vy = ESCAPE_SPEED * math.sin(angle)
                 await drone.offboard.set_velocity_ned(VelocityNedYaw(vx, vy, 0.0, my_yaw or 0))
-                await asyncio.sleep(0.4)
-            elif ESCAPE_DISTANCE <= dist <= 30:
-                print(f"{CYAN}🔄 Flocking Aktif: {dist:.1f}m{ENDC}")
-                sep_angle = math.atan2(my_lon - nearest["longitude"], my_lat - nearest["latitude"])
-                ali_angle = math.radians(nearest.get("yaw", 0))
-                coh_angle = math.atan2(nearest["longitude"] - my_lon, nearest["latitude"] - my_lat)
+                await asyncio.sleep(0.2)
 
-                vx = 2 * math.cos(sep_angle) + 1 * math.cos(ali_angle) + 1 * math.cos(coh_angle)
-                vy = 2 * math.sin(sep_angle) + 1 * math.sin(ali_angle) + 1 * math.sin(coh_angle)
-                final_yaw = math.degrees(math.atan2(vy, vx))
-                await drone.offboard.set_velocity_ned(VelocityNedYaw(FLOCK_SPEED, 0.0, 0.0, final_yaw))
+            elif ESCAPE_DISTANCE <= dist < (TARGET_DISTANCE - 1):
+                # 10-14m: Uzaklaş (kohezyon - sabit mesafeye çekil)
+                print(f"{CYAN}⬅️ Kohezyon (Uzaklaş): {dist:.1f}m{ENDC}")
+                angle = math.atan2(my_lon - nearest["longitude"], my_lat - nearest["latitude"])
+                vx = COHESION_SPEED * math.cos(angle)
+                vy = COHESION_SPEED * math.sin(angle)
+                await drone.offboard.set_velocity_ned(VelocityNedYaw(vx, vy, 0.0, yaw_to_other))
                 await asyncio.sleep(0.15)
+
+            elif (TARGET_DISTANCE - 1) <= dist <= (TARGET_DISTANCE + 1):
+                # 14-16m: Sabit tut
+                print(f"{GREEN}✅ Mesafe Sabit: {dist:.1f}m{ENDC}")
+                await drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, my_yaw or 0))
+                await asyncio.sleep(0.15)
+
+            elif dist > (TARGET_DISTANCE + 1):
+                # 16m üstü: yaklaş (kohezyon)
+                print(f"{BLUE}➡️ Kohezyon (Yaklaş): {dist:.1f}m{ENDC}")
+                angle = math.atan2(nearest["longitude"] - my_lon, nearest["latitude"] - my_lat)
+                vx = COHESION_SPEED * math.cos(angle)
+                vy = COHESION_SPEED * math.sin(angle)
+                await drone.offboard.set_velocity_ned(VelocityNedYaw(vx, vy, 0.0, yaw_to_other))
+                await asyncio.sleep(0.15)
+
             else:
                 print(f"{YELLOW}🟢 Serbest uçuş: {dist:.1f}m{ENDC}")
                 await drone.offboard.set_velocity_ned(VelocityNedYaw(NORMAL_SPEED, 0.0, 0.0, my_yaw or 0))
                 await asyncio.sleep(0.25)
+
         except Exception as e:
             print(f"{RED}[Flocking Controller Hatası]: {e}{ENDC}")
             await asyncio.sleep(0.05)
@@ -185,8 +202,15 @@ async def run():
         telemetry_shm = shm.SharedMemory(name=SHM_NAME)
         print(f"{YELLOW}[SHM] Mevcut alana bağlandı.{ENDC}")
 
-    print(f"{BLUE}[Drone{drone_id}] Arming ve Offboard başlatılıyor...{ENDC}")
+    print(f"{BLUE}[Drone{drone_id}] Arming başlatılıyor...{ENDC}")
     await drone.action.arm()
+    await asyncio.sleep(4)  # Arming sonrası kısa bekleme
+
+    print(f"{BLUE}[Drone{drone_id}] Takeoff başlatılıyor...{ENDC}")
+    await drone.action.takeoff()
+    await asyncio.sleep(22)  # Takeoff sonrası drone havalansın (10 saniye!)
+
+    print(f"{BLUE}[Drone{drone_id}] Offboard başlatılıyor...{ENDC}")
     await drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
     await drone.offboard.start()
 
