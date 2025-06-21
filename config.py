@@ -116,34 +116,42 @@ FONTS = {
     "button_small": ("Roboto", 12, "bold") # Daha küçük kart butonları için
 }
 
-# Commands - MODIFIED TO PREVENT NEW TERMINAL WINDOWS
 COMMANDS = {
-    # QGroundControl'u başlat
+    # QGC command: QGroundControl GUI uygulamasını başlatır.
     "qgc": """
         cd ~/PX4-Autopilot || exit 1;
         export LIBGL_ALWAYS_SOFTWARE=1;
-        ./QGroundControl.AppImage
+        ./QGroundControl.AppImage &
     """,
 
-    # Drone 1 başlatma (pozisyon verilmediği için varsayılan pozisyonda)
-    "drone1": """
-        cd ~/PX4-Autopilot || exit 1;
-        export LIBGL_ALWAYS_SOFTWARE=1;
-        tmux kill-session -t drone1_session 2>/dev/null;
-        tmux new-session -d -s drone1_session "PX4_SYS_AUTOSTART=4001 PX4_SIM_MODEL=gz_x500_mono_cam PX4_GZ_WORLD=baylands ./build/px4_sitl_default/bin/px4 -i 1";
-        sleep 30;
-        tmux kill-session -t drone1_py 2>/dev/null;
-        tmux new-session -d -s drone1_py "python3 /home/arda/Masaüstü/Drone1_bayland.py"
-    """,
-
-    # Drone 2 başlatma (pozisyon: 0,10)
+    # Drone 1'yi başlatır (ID: 2, Pozisyon: 0,5)
     "drone2": """
         cd ~/PX4-Autopilot || exit 1;
         export LIBGL_ALWAYS_SOFTWARE=1;
         tmux kill-session -t drone2_session 2>/dev/null;
-        tmux new-session -d -s drone2_session "PX4_SYS_AUTOSTART=4001 PX4_SIM_MODEL=gz_x500_mono_cam PX4_GZ_WORLD=baylands PX4_GZ_MODEL_POSE='0,10' ./build/px4_sitl_default/bin/px4 -i 2";
-        sleep 30;
+        tmux new-session -d -s drone2_session "export LIBGL_ALWAYS_SOFTWARE=1; cd ~/PX4-Autopilot; PX4_SYS_AUTOSTART=4001 PX4_SIM_MODEL=gz_x500_mono_cam PX4_GZ_WORLD=baylands PX4_GZ_MODEL_POSE='0,5' ./build/px4_sitl_default/bin/px4 -i 1";
+        sleep 45;
         tmux kill-session -t drone2_py 2>/dev/null;
-        tmux new-session -d -s drone2_py "python3 /home/arda/Masaüstü/Drone2_bayland.py"
+        tmux new-session -d -s drone2_py "python3 /home/arda/Masaüstü/ucak1.py"
+    """,
+
+    # Drone 2'i başlatır (ID: 1, Pozisyon: default)
+    "drone1": """
+        cd ~/PX4-Autopilot || exit 1;
+        export LIBGL_ALWAYS_SOFTWARE=1;
+        tmux kill-session -t drone1_session 2>/dev/null;
+        tmux new-session -d -s drone1_session "export LIBGL_ALWAYS_SOFTWARE=1; cd ~/PX4-Autopilot; PX4_SYS_AUTOSTART=4001 PX4_SIM_MODEL=gz_x500_mono_cam PX4_GZ_WORLD=baylands ./build/px4_sitl_default/bin/px4 -i 2";
+        sleep 45;
+        tmux kill-session -t drone1_py 2>/dev/null;
+        tmux new-session -d -s drone1_py "python3 /home/arda/Masaüstü/ucak2.py"
     """
-}
+} 
+
+
+
+
+
+
+
+
+
