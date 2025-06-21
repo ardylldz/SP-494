@@ -129,10 +129,10 @@ COMMANDS = {
         cd ~/PX4-Autopilot || exit 1;
         export LIBGL_ALWAYS_SOFTWARE=1;
         tmux kill-session -t drone2_session 2>/dev/null;
-        tmux new-session -d -s drone2_session "export LIBGL_ALWAYS_SOFTWARE=1; cd ~/PX4-Autopilot; PX4_SYS_AUTOSTART=4001 PX4_SIM_MODEL=gz_x500_mono_cam PX4_GZ_WORLD=baylands PX4_GZ_MODEL_POSE='0,5' ./build/px4_sitl_default/bin/px4 -i 1";
+        tmux new-session -d -s drone2_session "export LIBGL_ALWAYS_SOFTWARE=1; cd ~/PX4-Autopilot; HEADLESS=1 PX4_SYS_AUTOSTART=4001 PX4_SIM_MODEL=gz_x500_mono_cam 	 	PX4_GZ_MODEL_POSE='0,5' ./build/px4_sitl_default/bin/px4 -i 1";
         sleep 45;
         tmux kill-session -t drone2_py 2>/dev/null;
-        tmux new-session -d -s drone2_py "python3 /home/arda/Masaüstü/ucak1.py"
+        tmux new-session -d -s drone2_py "python3 /home/arda/Masaüstü/ucak11.py"
     """,
 
     # Drone 2'i başlatır (ID: 1, Pozisyon: default)
@@ -140,12 +140,16 @@ COMMANDS = {
         cd ~/PX4-Autopilot || exit 1;
         export LIBGL_ALWAYS_SOFTWARE=1;
         tmux kill-session -t drone1_session 2>/dev/null;
-        tmux new-session -d -s drone1_session "export LIBGL_ALWAYS_SOFTWARE=1; cd ~/PX4-Autopilot; PX4_SYS_AUTOSTART=4001 PX4_SIM_MODEL=gz_x500_mono_cam PX4_GZ_WORLD=baylands ./build/px4_sitl_default/bin/px4 -i 2";
+        tmux new-session -d -s drone1_session "export LIBGL_ALWAYS_SOFTWARE=1; cd ~/PX4-Autopilot; HEADLESS=1 PX4_SYS_AUTOSTART=4001 PX4_SIM_MODEL=gz_x500_mono_cam  ./build/px4_sitl_default/bin/px4 -i 2";
         sleep 45;
         tmux kill-session -t drone1_py 2>/dev/null;
-        tmux new-session -d -s drone1_py "python3 /home/arda/Masaüstü/ucak2.py"
+        tmux new-session -d -s drone1_py "python3 /home/arda/Masaüstü/ucak22.py"
     """
 } 
+
+
+
+
 
 
 
